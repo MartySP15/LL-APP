@@ -18,6 +18,8 @@ import {
   Home,
   LogOut,
   Download,
+  Upload,
+  FileSpreadsheet,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
@@ -66,6 +68,33 @@ const STATUS_LABEL = {
   fulfilled: "Fulfilled",
   cancelled: "Cancelled",
 };
+
+const NAME_KEYS = ["name", "customer", "customer name", "full name", "client", "client name"];
+const EMAIL_KEYS = ["email", "email address", "e-mail"];
+const PHONE_KEYS = ["phone", "phone number", "mobile", "tel", "telephone"];
+const ADDRESS_KEYS = ["address", "billing address", "address 1"];
+
+function pickField(row, keys) {
+  const lowerMap = {};
+  Object.keys(row).forEach((k) => {
+    lowerMap[k.trim().toLowerCase()] = row[k];
+  });
+  for (const k of keys) {
+    if (lowerMap[k] !== undefined && String(lowerMap[k]).trim() !== "") {
+      return String(lowerMap[k]).trim();
+    }
+  }
+  return "";
+}
+
+function normalizeImportRow(row) {
+  return {
+    name: pickField(row, NAME_KEYS),
+    email: pickField(row, EMAIL_KEYS),
+    phone: pickField(row, PHONE_KEYS),
+    address: pickField(row, ADDRESS_KEYS),
+  };
+}
 
 function exportCustomersToExcel(customers, orders) {
   const rows = customers.map((c) => ({
@@ -271,6 +300,46 @@ export default function App() {
     else fetchAll();
   };
 
+  const importCustomers = async (rawRows) => {
+    const rows = rawRows.map(normalizeImportRow).filter((r) => r.name);
+    const toInsert = [];
+    const toUpdate = [];
+    let skipped = rawRows.length - rows.length;
+
+    rows.forEach((row) => {
+      const existing = customers.find((c) => {
+        if (row.email && c.email) return c.email.trim().toLowerCase() === row.email.toLowerCase();
+        return c.name.trim().toLowerCase() === row.name.toLowerCase();
+      });
+      if (existing) {
+        const patch = {};
+        if (row.email && row.email !== existing.email) patch.email = row.email;
+        if (row.phone && row.phone !== existing.phone) patch.phone = row.phone;
+        if (row.address && row.address !== existing.address) patch.address = row.address;
+        if (Object.keys(patch).length > 0) toUpdate.push({ id: existing.id, patch });
+      } else {
+        toInsert.push({ name: row.name, email: row.email, phone: row.phone, address: row.address });
+      }
+    });
+
+    try {
+      if (toInsert.length > 0) {
+        const { error: insErr } = await supabase.from("customers").insert(toInsert);
+        if (insErr) throw insErr;
+      }
+      for (const u of toUpdate) {
+        const { error: updErr } = await supabase.from("customers").update(u.patch).eq("id", u.id);
+        if (updErr) throw updErr;
+      }
+      await fetchAll();
+      setError(null);
+      return { added: toInsert.length, updated: toUpdate.length, skipped };
+    } catch (e) {
+      setError(e.message || "Import failed.");
+      return { added: 0, updated: 0, skipped: rawRows.length, failed: true };
+    }
+  };
+
   const deleteCustomer = async (id) => {
     const { error: err } = await supabase.from("customers").delete().eq("id", id);
     if (err) setError(err.message);
@@ -397,6 +466,7 @@ export default function App() {
               onAdd={addCustomer}
               onUpdate={updateCustomer}
               onDelete={deleteCustomer}
+              onImport={importCustomers}
             />
           )}
           {view === "orders" && !activeOrder && (
@@ -1081,10 +1151,14 @@ function PaymentBadge({ status }) {
    Customers
 --------------------------------------------------------------- */
 
-function CustomersView({ customers, orders, onAdd, onUpdate, onDelete }) {
+function CustomersView({ customers, orders, onAdd, onUpdate, onDelete, onImport }) {
   const [query, setQuery] = useState("");
   const [modalCustomer, setModalCustomer] = useState(undefined); // undefined = closed, null = new, obj = edit
   const [pendingDelete, setPendingDelete] = useState(null);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState(null);
+  const [pendingWorkbook, setPendingWorkbook] = useState(null); // { workbook, fileName } when picking a sheet
+  const fileInputRef = React.useRef(null);
 
   const filtered = customers.filter((c) =>
     (c.name + " " + c.email).toLowerCase().includes(query.toLowerCase())
@@ -1092,10 +1166,66 @@ function CustomersView({ customers, orders, onAdd, onUpdate, onDelete }) {
 
   const orderCount = (id) => orders.filter((o) => o.customerId === id).length;
 
+  const runImportForSheet = async (workbook, sheetName) => {
+    setImporting(true);
+    setImportResult(null);
+    try {
+      const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" });
+      const result = await onImport(rows);
+      setImportResult(result);
+    } catch (err) {
+      setImportResult({ failed: true, message: err.message || "Couldn't read that sheet." });
+    } finally {
+      setImporting(false);
+      setPendingWorkbook(null);
+    }
+  };
+
+  const handleFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+    setImportResult(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const workbook = XLSX.read(buf, { type: "array" });
+      if (workbook.SheetNames.length > 1) {
+        // Ask which sheet to use instead of guessing
+        setPendingWorkbook({ workbook, fileName: file.name });
+      } else {
+        await runImportForSheet(workbook, workbook.SheetNames[0]);
+      }
+    } catch (err) {
+      setImportResult({ failed: true, message: err.message || "Couldn't read that file." });
+    }
+  };
+
   return (
     <div>
       <h1 className="page-title">Customers</h1>
       <p className="page-sub">Everyone you've billed, in one place.</p>
+
+      {importResult && (
+        <div
+          className="save-banner"
+          style={
+            importResult.failed
+              ? {}
+              : { background: "var(--sage-bg)", color: "var(--sage)" }
+          }
+        >
+          {importResult.failed ? (
+            <>
+              <AlertCircle size={14} /> {importResult.message || "Import failed."}
+            </>
+          ) : (
+            <>
+              <AlertCircle size={14} /> Imported: {importResult.added} added, {importResult.updated} updated
+              {importResult.skipped > 0 ? `, ${importResult.skipped} skipped (no name)` : ""}.
+            </>
+          )}
+        </div>
+      )}
 
       <div className="toolbar">
         <div className="search-box">
@@ -1103,6 +1233,21 @@ function CustomersView({ customers, orders, onAdd, onUpdate, onDelete }) {
           <input placeholder="Search customers…" value={query} onChange={(e) => setQuery(e.target.value)} />
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            style={{ display: "none" }}
+            onChange={handleFileChange}
+          />
+          <button
+            className="btn btn-ghost"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={importing}
+            style={importing ? { opacity: 0.5, cursor: "not-allowed" } : {}}
+          >
+            <Upload size={14} /> {importing ? "Importing…" : "Import Excel"}
+          </button>
           <button
             className="btn btn-ghost"
             onClick={() => exportCustomersToExcel(customers, orders)}
@@ -1182,6 +1327,37 @@ function CustomersView({ customers, orders, onAdd, onUpdate, onDelete }) {
             setPendingDelete(null);
           }}
         />
+      )}
+
+      {pendingWorkbook && (
+        <div className="modal-overlay" onClick={() => setPendingWorkbook(null)}>
+          <div className="modal-card" style={{ maxWidth: 420 }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Which sheet?</h2>
+              <button className="icon-btn" onClick={() => setPendingWorkbook(null)}><X size={15} /></button>
+            </div>
+            <div className="modal-body">
+              <p style={{ marginTop: 0, fontSize: 13.5, color: "var(--ink-soft)" }}>
+                <strong>{pendingWorkbook.fileName}</strong> has {pendingWorkbook.workbook.SheetNames.length} sheets. Pick the one with your customer list.
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {pendingWorkbook.workbook.SheetNames.map((name) => (
+                  <button
+                    key={name}
+                    className="btn btn-ghost"
+                    style={{ justifyContent: "flex-start" }}
+                    onClick={() => runImportForSheet(pendingWorkbook.workbook, name)}
+                  >
+                    <FileSpreadsheet size={14} /> {name}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-ghost" onClick={() => setPendingWorkbook(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
