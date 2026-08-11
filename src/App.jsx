@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
+import * as XLSX from "xlsx";
 import {
   LayoutDashboard,
   Users,
@@ -15,6 +16,8 @@ import {
   AlertCircle,
   Settings,
   Home,
+  LogOut,
+  Download,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
@@ -63,6 +66,57 @@ const STATUS_LABEL = {
   fulfilled: "Fulfilled",
   cancelled: "Cancelled",
 };
+
+function exportCustomersToExcel(customers, orders) {
+  const rows = customers.map((c) => ({
+    Name: c.name,
+    Email: c.email || "",
+    Phone: c.phone || "",
+    Address: c.address || "",
+    Orders: orders.filter((o) => o.customerId === c.id).length,
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws["!cols"] = [{ wch: 24 }, { wch: 26 }, { wch: 16 }, { wch: 32 }, { wch: 8 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Customers");
+  XLSX.writeFile(wb, `customers-${todayISO()}.xlsx`);
+}
+
+function exportOrdersToExcel(orders, customers) {
+  const rows = orders.map((o) => {
+    const t = computeTotals(o);
+    const customer = customers.find((c) => c.id === o.customerId);
+    const itemsText = (o.items || [])
+      .map((it) => `${it.description} (x${it.qty} @ ${fmtMoney(it.price)})`)
+      .join("; ");
+    return {
+      "Order #": o.orderNumber,
+      "Invoice #": o.invoiceNumber || "",
+      Customer: customer?.name || "",
+      Date: o.date || "",
+      "Due Date": o.dueDate || "",
+      Status: STATUS_LABEL[o.orderStatus] || o.orderStatus,
+      "Payment Status": t.paymentStatus,
+      Items: itemsText,
+      Subtotal: Number(t.subtotal.toFixed(2)),
+      "Tax %": o.taxRate || 0,
+      Tax: Number(t.taxAmt.toFixed(2)),
+      Total: Number(t.total.toFixed(2)),
+      Paid: Number(t.paid.toFixed(2)),
+      Balance: Number(t.balance.toFixed(2)),
+      Notes: o.notes || "",
+    };
+  });
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws["!cols"] = [
+    { wch: 12 }, { wch: 12 }, { wch: 22 }, { wch: 12 }, { wch: 12 },
+    { wch: 12 }, { wch: 14 }, { wch: 40 }, { wch: 11 }, { wch: 8 },
+    { wch: 10 }, { wch: 11 }, { wch: 11 }, { wch: 11 }, { wch: 30 },
+  ];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Orders");
+  XLSX.writeFile(wb, `orders-${todayISO()}.xlsx`);
+}
 
 const DEFAULT_BUSINESS = {
   name: "Liveable Layouts",
@@ -148,6 +202,7 @@ function businessToDb(b) {
 --------------------------------------------------------------- */
 
 export default function App() {
+  const [session, setSession] = useState(undefined); // undefined = checking, null = logged out, object = logged in
   const [customers, setCustomers] = useState([]);
   const [orders, setOrders] = useState([]);
   const [business, setBusiness] = useState(DEFAULT_BUSINESS);
@@ -157,6 +212,14 @@ export default function App() {
   const [view, setView] = useState("dashboard");
   const [activeOrderId, setActiveOrderId] = useState(null);
   const [invoiceOrderId, setInvoiceOrderId] = useState(null);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, sess) => {
+      setSession(sess);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -180,6 +243,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!session) return;
     fetchAll();
     // Live sync: refetch when any team member changes data.
     const channel = supabase
@@ -191,7 +255,7 @@ export default function App() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [fetchAll]);
+  }, [session, fetchAll]);
 
   /* ---- Customers ---- */
 
@@ -270,6 +334,24 @@ export default function App() {
     else fetchAll();
   };
 
+  if (session === undefined) {
+    return (
+      <Shell>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--ink-soft)" }}>
+          Checking session…
+        </div>
+      </Shell>
+    );
+  }
+
+  if (!session) {
+    return (
+      <Shell>
+        <LoginScreen />
+      </Shell>
+    );
+  }
+
   if (!loaded) {
     return (
       <Shell>
@@ -286,7 +368,12 @@ export default function App() {
   return (
     <Shell>
       <div className="app-grid">
-        <Sidebar view={view} setView={(v) => { setView(v); setActiveOrderId(null); }} />
+        <Sidebar
+          view={view}
+          setView={(v) => { setView(v); setActiveOrderId(null); }}
+          userEmail={session.user?.email}
+          onSignOut={() => supabase.auth.signOut()}
+        />
         <main className="main">
           {error && (
             <div className="save-banner">
@@ -393,6 +480,19 @@ function Shell({ children }) {
           padding: 24px 0;
         }
         .nav-main { flex: 1; }
+        .sidebar-account {
+          border-top: 1px solid rgba(255,255,255,0.2);
+          margin-top: 10px;
+          padding-top: 8px;
+        }
+        .sidebar-email {
+          padding: 4px 20px 6px;
+          font-size: 11.5px;
+          color: rgba(255,255,255,0.75);
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
         .brand {
           padding: 0 20px 20px 20px;
           border-bottom: 1px solid rgba(255,255,255,0.25);
@@ -703,10 +803,60 @@ function ConfirmModal({ title, message, confirmLabel = "Delete", onConfirm, onCa
 }
 
 /* ---------------------------------------------------------------
+   Login
+--------------------------------------------------------------- */
+
+function LoginScreen() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    const { error: err } = await supabase.auth.signInWithPassword({ email, password });
+    if (err) setError(err.message);
+    setLoading(false);
+  };
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
+      <form onSubmit={handleSubmit} className="modal-card" style={{ width: 360, padding: "32px 28px" }}>
+        <div style={{ marginBottom: 20 }}>
+          <div className="brand-mark" style={{ color: "var(--brass)" }}>Liveable Layouts</div>
+          <h2 style={{ margin: "4px 0 0", fontSize: 19 }}>Sign in</h2>
+        </div>
+        {error && (
+          <div className="save-banner" style={{ marginBottom: 14 }}>
+            <AlertCircle size={14} /> {error}
+          </div>
+        )}
+        <div className="field">
+          <label>Email</label>
+          <input type="email" required autoFocus value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@business.com" />
+        </div>
+        <div className="field">
+          <label>Password</label>
+          <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
+        </div>
+        <button className="btn btn-primary" type="submit" disabled={loading} style={{ width: "100%", justifyContent: "center", marginTop: 6 }}>
+          {loading ? "Signing in…" : "Sign In"}
+        </button>
+        <p style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 14, marginBottom: 0 }}>
+          Don't have an account? Ask your admin to add you in Supabase (Authentication → Users).
+        </p>
+      </form>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
    Sidebar
 --------------------------------------------------------------- */
 
-function Sidebar({ view, setView }) {
+function Sidebar({ view, setView, userEmail, onSignOut }) {
   const items = [
     { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
     { key: "customers", label: "Customers", icon: Users },
@@ -736,6 +886,13 @@ function Sidebar({ view, setView }) {
       >
         <Settings size={16} />
         Business Details
+      </div>
+      <div className="sidebar-account">
+        {userEmail && <div className="sidebar-email">{userEmail}</div>}
+        <div className="nav-item" onClick={onSignOut}>
+          <LogOut size={16} />
+          Sign Out
+        </div>
       </div>
     </nav>
   );
@@ -945,9 +1102,19 @@ function CustomersView({ customers, orders, onAdd, onUpdate, onDelete }) {
           <Search size={14} color="var(--ink-soft)" />
           <input placeholder="Search customers…" value={query} onChange={(e) => setQuery(e.target.value)} />
         </div>
-        <button className="btn btn-primary" onClick={() => setModalCustomer(null)}>
-          <Plus size={15} /> Add Customer
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            className="btn btn-ghost"
+            onClick={() => exportCustomersToExcel(customers, orders)}
+            disabled={customers.length === 0}
+            style={customers.length === 0 ? { opacity: 0.5, cursor: "not-allowed" } : {}}
+          >
+            <Download size={14} /> Export Excel
+          </button>
+          <button className="btn btn-primary" onClick={() => setModalCustomer(null)}>
+            <Plus size={15} /> Add Customer
+          </button>
+        </div>
       </div>
 
       {filtered.length === 0 ? (
@@ -1101,9 +1268,19 @@ function OrdersListView({ orders, customers, onAdd, onOpen, onGoToCustomers }) {
           <Search size={14} color="var(--ink-soft)" />
           <input placeholder="Search orders…" value={query} onChange={(e) => setQuery(e.target.value)} />
         </div>
-        <button className="btn btn-primary" onClick={handleNewOrderClick}>
-          <Plus size={15} /> New Order
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            className="btn btn-ghost"
+            onClick={() => exportOrdersToExcel(sorted, customers)}
+            disabled={sorted.length === 0}
+            style={sorted.length === 0 ? { opacity: 0.5, cursor: "not-allowed" } : {}}
+          >
+            <Download size={14} /> Export Excel
+          </button>
+          <button className="btn btn-primary" onClick={handleNewOrderClick}>
+            <Plus size={15} /> New Order
+          </button>
+        </div>
       </div>
 
       {customers.length === 0 && (
